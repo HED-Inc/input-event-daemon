@@ -17,6 +17,14 @@
  *
  */
 
+typedef struct listener{
+    const char          *listen;
+    int                 fd;
+    int                 debouncing;
+    struct timeval      trigger_time;
+    struct input_event  event;
+} listener_t;
+
 struct {
     const char      *configfile;
 
@@ -26,8 +34,10 @@ struct {
 
     unsigned long   min_timeout;
 
-    const char      *listen[MAX_LISTENER];
-    int             listen_fd[MAX_LISTENER];
+    int             debounce_period;
+    listener_t      listener[MAX_LISTENER];
+//    const char      *listen[MAX_LISTENER];
+//    int             listen_fd[MAX_LISTENER];
 
     struct termios  terminal;
 } conf;
@@ -105,6 +115,7 @@ void                config_parse_file();
 static const char   *config_key_event(char *shortcut, char *exec);
 static const char   *config_idle_event(char *timeout, char *exec);
 static const char   *config_switch_event(char *switchcode, char *exec);
+static const char   *config_settings(char *switchcode, char *exec);
 static unsigned int config_min_timeout(unsigned long a, unsigned long b);
 static char         *config_trim_string(char *str);
 

@@ -309,7 +309,7 @@ void input_open_all_listener() {
             }
             continue;
         }
-        conf.listen[listen_len++] = strdup(filename);
+        conf.listener[listen_len++].listen = strdup(filename);
     }
 }
 
@@ -317,13 +317,13 @@ void input_list_devices() {
     int fd, i, e;
     unsigned char evmask[EV_MAX/8 + 1];
 
-    for(i=0; i < MAX_LISTENER && conf.listen[i] != NULL; i++) {
+    for(i=0; i < MAX_LISTENER && conf.listener[i].listen != NULL; i++) {
         char phys[64] = "no physical path", name[256] = "Unknown Device";
 
-        fd = open(conf.listen[i], O_RDONLY);
+        fd = open(conf.listener[i].listen, O_RDONLY);
         if(fd < 0) {
             fprintf(stderr, PROGRAM": open(%s): %s\n",
-                conf.listen[i], strerror(errno));
+                conf.listener[i].listen, strerror(errno));
             continue;
         }
 
@@ -333,7 +333,7 @@ void input_list_devices() {
         ioctl(fd, EVIOCGPHYS(sizeof(phys)), phys);
         ioctl(fd, EVIOCGBIT(0, sizeof(evmask)), evmask);
 
-        printf("%s:\n", conf.listen[i]);
+        printf("%s:\n", conf.listener[i].listen);
         printf("  name     : %s\n", name);
         printf("  phys     : %s\n", phys);
 
@@ -364,20 +364,25 @@ void input_list_devices() {
 static void input_parse_event(struct input_event *event, const char *src) {
     key_event_t *fired_key_event;
     switch_event_t *fired_switch_event;
+    fprintf(stderr, "start parsing event: %d:%d\n", event->type, EV_KEY);
 
     switch(event->type) {
         case EV_KEY:
+            fprintf(stderr, "button key event about to launch\n");
             fired_key_event = key_event_parse(event->code, event->value, src);
 
             if(fired_key_event != NULL) {
+                fprintf(stderr, "found code: %d\n", event->code);
                 daemon_exec(fired_key_event->exec);
             }
             break;
         case EV_SW:
+            fprintf(stderr, "switch key event about to launch\n");
             fired_switch_event =
                 switch_event_parse(event->code, event->value, src);
 
             if(fired_switch_event != NULL) {
+                fprintf(stderr, "found code: %d\n", event->code);
                 daemon_exec(fired_switch_event->exec);
             }
 
@@ -433,7 +438,7 @@ void config_parse_file() {
 
         key = config_trim_string(key);
         value = config_trim_string(value);
-
+        fprintf(stderr, "******%s \n", section);
         if(section == NULL) {
             error = "Missing section!";
         } else if(strlen(key) == 0 || strlen(value) == 0) {
@@ -441,7 +446,7 @@ void config_parse_file() {
         } else if(strcasecmp(section, "Global") == 0) {
             if(strcmp(key, "listen") == 0) {
                 if(listen_len < MAX_LISTENER) {
-                    conf.listen[listen_len++] = strdup(value);
+                    conf.listener[listen_len++].listen = strdup(value);
                 } else {
                     error = "Listener limit exceeded!";
                 }
@@ -454,6 +459,8 @@ void config_parse_file() {
             error = config_idle_event(key, value);
         } else if(strcasecmp(section, "Switches") == 0) {
             error = config_switch_event(key, value);
+        } else if(strcasecmp(section, "Settings") == 0) {
+            error = config_settings(key, value);
         } else {
             error = "Unknown section!";
             section = NULL;
@@ -598,6 +605,17 @@ static const char *config_switch_event(char *switchcode, char *exec) {
     return NULL;
 }
 
+static const char *config_settings(char *switchcode, char *exec) {
+    char *code, *value;
+    switch_event_t *new_switch_event;
+    fprintf(stderr, "----------%s\n", switchcode);
+    if( strcmp(switchcode, "DEBOUNCE") == 0 ){
+        conf.debounce_period = atoi(exec);
+        fprintf(stderr, "DEBOUNCE set to %d \n", conf.debounce_period); 
+    }
+    return NULL;
+}
+
 static unsigned int config_min_timeout(unsigned long a, unsigned long b) {
     if(b == 0) return a;
 
@@ -626,16 +644,52 @@ void daemon_init() {
     conf.verbose     = 0;
     conf.daemon      = 1;
 
+    conf.debounce_period = 500;
+
     conf.min_timeout = 3600;
 
     for(i=0; i<MAX_LISTENER; i++) {
-        conf.listen[i]    = NULL;
-        conf.listen_fd[i] = 0;
+        conf.listener[i].listen    = NULL;
+        conf.listener[i].fd = 0;
+        conf.listener[i].debouncing = 0;
+    }
+}
+
+void debounce_check(listener_t *listener, fd_set *fdset){
+    struct timeval now;
+    unsigned long now_time, trigger_time;
+    if(FD_ISSET(listener->fd, fdset)){
+        if(listener->debouncing == 1){
+            struct input_event tmp;
+            if(read(listener->fd, &tmp, sizeof(listener->event)) < 0) {
+                fprintf(stderr, PROGRAM": read(%s): %s\n",
+                    listener->listen, strerror(errno));
+            }
+        } else{
+            if(read(listener->fd, &(listener->event), sizeof(listener->event)) < 0) {
+                fprintf(stderr, PROGRAM": read(%s): %s\n",
+                    listener->listen, strerror(errno));
+            }
+        }
+        listener->debouncing = 1;
+        gettimeofday(&(listener->trigger_time), NULL);
+        fprintf(stderr, "event type: %d\n", listener->event.type);
+    } else {
+        if(listener->debouncing == 1){
+            gettimeofday(&now, NULL);
+            now_time       = now.tv_sec *  1000 + now.tv_usec / 1000;
+            trigger_time   = listener->trigger_time.tv_sec   *  1000 + listener->trigger_time.tv_usec  /  1000;
+            if((now_time - trigger_time) > conf.debounce_period){
+                listener->debouncing = 0;
+                fprintf(stderr, "Start event\n");
+                input_parse_event(&listener->event, listener->listen);
+            }
+        }
     }
 }
 
 void daemon_start_listener() {
-    int i, n, select_r, fd_len;
+    int i, n, select_r, fd_len, any_debouncing;
     unsigned long tms_start, tms_end, idle_time = 0;
     unsigned char sw_states[SW_MAX/8 + 1];
     fd_set fdset, initial_fdset;
@@ -647,22 +701,22 @@ void daemon_start_listener() {
     signal(SIGCHLD, SIG_IGN);
 
     FD_ZERO(&initial_fdset);
-    for(i=0; i < MAX_LISTENER && conf.listen[i] != NULL; i++) {
-        conf.listen_fd[i] = open(conf.listen[i], O_RDONLY);
+    for(i=0; i < MAX_LISTENER && conf.listener[i].listen != NULL; i++) {
+        conf.listener[i].fd = open(conf.listener[i].listen, O_RDONLY);
 
-        if(conf.listen_fd[i] < 0) {
+        if(conf.listener[i].fd < 0) {
             fprintf(stderr, PROGRAM": open(%s): %s\n",
-                conf.listen[i], strerror(errno));
+                conf.listener[i].listen, strerror(errno));
             exit(EXIT_FAILURE);
         }
-        FD_SET(conf.listen_fd[i], &initial_fdset);
-        ioctl(conf.listen_fd[i], EVIOCGSW(sizeof(sw_states)), &sw_states);
+        FD_SET(conf.listener[i].fd, &initial_fdset);
+        ioctl(conf.listener[i].fd, EVIOCGSW(sizeof(sw_states)), &sw_states);
         for (n=0; n < SW_MAX; n++) {
             memset(&event, '\0', sizeof(event));
             event.type = EV_SW;
             event.code = n;
             event.value = (sw_states[n/8] >> n%8) & 0x1;
-            input_parse_event(&event, conf.listen[i]);
+            input_parse_event(&event, conf.listener[i].listen);
         }
     }
 
@@ -708,7 +762,9 @@ void daemon_start_listener() {
 
         gettimeofday(&tv_start, NULL);
 
-        select_r = select(conf.listen_fd[fd_len-1]+1, &fdset, NULL, NULL, &tv);
+//remove line below if performing interval test.
+        select_r = select(conf.listener[fd_len-1].fd+1, &fdset, NULL, NULL, &tv);
+        fprintf(stderr, "Initial Event Triggered\n");
 
         gettimeofday(&tv_end, NULL);
 
@@ -728,17 +784,77 @@ void daemon_start_listener() {
             idle_event_parse(IDLE_RESET);
             idle_time = 0;
         }
+//Forever loop test
+        while(0){
+            tv.tv_sec = 1;
+            tv.tv_sec = 0;
 
-        for(i=0; i<fd_len; i++) {
-            if(FD_ISSET(conf.listen_fd[i], &fdset)) {
-                if(read(conf.listen_fd[i], &event, sizeof(event)) < 0) {
-                    fprintf(stderr, PROGRAM": read(%s): %s\n",
-                        conf.listen[i], strerror(errno));
-                    break;
-                }
-                input_parse_event(&event, conf.listen[i]);
+            select_r = select(conf.listener[fd_len-1].fd+1, &fdset, NULL, NULL, &tv);
+            if(select_r == 0){
+                fprintf(stderr, "Timeout Occured\n");
+            } else{
+                fprintf(stderr, "Event Occured \n");
             }
         }
+
+//Forever loop on interval test
+        unsigned long now_time, trigger_time;
+        struct timeval now;
+        struct timeval trigger;
+        int count = 0;
+        while(0){
+            gettimeofday(&trigger, NULL);
+            any_debouncing = 1;
+            fprintf(stderr, "restarting debounce period\n");
+            while(any_debouncing == 1){
+                FD_ZERO(&fdset);
+                FD_SET(conf.listener[0].fd, &fdset);
+                tv.tv_sec = 0;
+                tv.tv_usec = 1000;
+                select_r = select(conf.listener[fd_len-1].fd+1, &fdset, NULL, NULL, &tv);
+                if(select_r == 0){
+                    gettimeofday(&now, NULL);
+                    now_time       = now.tv_sec      *  1000 + now.tv_usec      /  1000;
+                    trigger_time   = trigger.tv_sec  *  1000 + trigger.tv_usec  /  1000;
+                    if((now_time - trigger_time) > 1000){
+                        any_debouncing = 0;
+                    }
+                } else if( select_r < 0){
+                        fprintf(stderr, PROGRAM": socket(%s): %s\n",
+                            conf.listener[0].listen, strerror(errno));
+                        break;
+                } 
+                else{
+                    fprintf(stderr, "an erroneous event was triggered: %d\n",count);
+                    if(read(conf.listener[0].fd, &event, sizeof(event)) < 0) {
+                        fprintf(stderr, PROGRAM": read(%s): %s\n",
+                            conf.listener[0].listen, strerror(errno));
+                        break;
+                    }
+                    fprintf(stderr, "an erroneous event was handled: %d\n", count++);
+                }
+            }
+        }
+
+// business logic
+        do{
+            any_debouncing = 0;
+            for(i=0; i<fd_len; i++) {
+                debounce_check(&(conf.listener[i]), &fdset);
+            }
+            for(i=0; i<fd_len; i++) {
+                if(conf.listener[i].debouncing == 1){
+                    any_debouncing = 1;
+                    break;
+                }
+            }
+            if(any_debouncing == 1){
+                fdset = initial_fdset;
+                tv.tv_sec = 0;
+                tv.tv_usec = 10000;
+                select_r = select(conf.listener[fd_len-1].fd+1, &fdset, NULL, NULL, &tv);
+            }
+        }while(any_debouncing == 1);
     }
 }
 
@@ -801,11 +917,11 @@ void daemon_clean() {
     }
     switch_event_n = 0;
 
-    for(i=0; i < MAX_LISTENER && conf.listen[i] != NULL; i++) {
-        free((void*) conf.listen[i]);
-        conf.listen[i] = NULL;
-        if(conf.listen_fd[i]) {
-            close(conf.listen_fd[i]);
+    for(i=0; i < MAX_LISTENER && conf.listener[i].listen != NULL; i++) {
+        free((void*) conf.listener[i].listen);
+        conf.listener[i].listen = NULL;
+        if(conf.listener[i].fd) {
+            close(conf.listener[i].fd);
         }
     }
 
